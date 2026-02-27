@@ -1,4 +1,4 @@
-# 🛡️ FaceLock: Intelligent Real-Time Face Locking System
+# FaceLock: Intelligent Real-Time Face Locking System
 
 [![Python Version](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/)
 [![Performance](https://img.shields.io/badge/CPU-Optimized-success.svg)](#performance-optimization)
@@ -8,17 +8,18 @@ A high-performance, CPU-optimized facial recognition and tracking system. Built 
 
 ---
 
-## ✨ Key Features
+## Key Features
 
--   **🔒 Target Face Locking**: Manually select and lock onto a specific identity. The system maintains a persistent lock even if the face briefly leaves the frame.
--   **⚡ High Performance**: Optimized with spatial identity caching and skip-frame recognition, achieving 30+ FPS on standard CPUs.
--   **📊 Action Detection**: Real-time detection of eye blinks, smiles, and head movements with smooth velocity tracking.
--   **📝 Automated Logging**: Generates timestamped session histories (`.txt`) documenting every detected action for behavior analysis.
--   **🎯 Sub-pixel Alignment**: Uses 5-point landmark alignment (eyes, nose, mouth) to ensure maximum accuracy for the ArcFace embedder.
+- **Target Face Locking**: Manually select and lock onto a specific identity. The system maintains a persistent lock even if the face briefly leaves the frame.
+- **High Performance**: Optimized with spatial identity caching and skip-frame recognition, achieving 30+ FPS on standard CPUs.
+- **Action Detection**: Real-time detection of eye blinks, smiles, and head movements with smooth velocity tracking.
+- **Automated Logging**: Generates timestamped session histories documenting every detected action for behavior analysis.
+- **MQTT Servo Control**: Integrated servo positioning system with P-controller and auto-scan functionality.
+- **Comprehensive Administration**: Advanced database management with cascade deletion and data cleaning capabilities.
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
 ### 1. Installation
 ```bash
@@ -51,54 +52,123 @@ rm buffalo_l.zip *.onnx
 
 ### 3. Usage
 - **Enroll a User**: `python -m src.enroll` (Capture face samples for the database)
-- **Run Locking System**: `python -m src.face_locking` (Main interface)
+- **Run Locking System**: `python main.py` (Main interface with servo control)
 - **Run Recognition**: `python -m src.recognize` (Multi-face demo)
+- **Database Administration**: `python admin_merged.py` (Advanced management tools)
 
 ---
 
-## 🛠️ Performance Optimization
+## Performance Optimization
 
-We have implemented several "Brain-Saving" techniques to ensure zero lag:
--   **Identity Caching**: Recognizes a face once and "follows the box" spatially, avoiding expensive AI re-calculations on every frame.
--   **Recognition Skipping**: Heavy AI verification runs only once every 10 frames or upon significant movement.
--   **Noise Filtering**: Minimum face size thresholds (100x100) prevent the CPU from wasting cycles on background shadows.
+We have implemented several techniques to ensure zero lag:
+- **Identity Caching**: Recognizes a face once and "follows the box" spatially, avoiding expensive AI re-calculations on every frame.
+- **Recognition Skipping**: Heavy AI verification runs only once every 10 frames or upon significant movement.
+- **Noise Filtering**: Minimum face size thresholds prevent the CPU from wasting cycles on background shadows.
 
 ---
 
-## 🎹 Controls
+## Controls
+
 | Key | Action |
 | :--- | :--- |
-| **L** | Toggle Lock on Target |
-| **S** | Save Action History |
-| **R** | Reload Face Database |
-| **m** | Toggle Mirror Mode |
-| **D** | Toggle Detailed UI |
 | **Q** | Quit System |
+| **R** | Reload Face Database |
+| **L** | Toggle Lock on Target |
+| **+/-** | Adjust Smile Detection Threshold |
+| **F1/F2** | Adjust Face Detection Sensitivity |
+| **M** | Toggle Mirror Mode |
+| **M** | Toggle Landmarks Display |
+| **C** | Toggle Confidence Display |
+| **D** | Toggle Detailed UI |
+| **[/]** | Adjust Window Scaling |
+| **S** | Save Action History |
+| **P** | Toggle MQTT Publishing |
 
 ---
 
-## 📂 Project Structure
+## Project Structure
 
 ```text
+├── main.py                 # Consolidated main application
+├── admin_merged.py         # Enhanced database administration
 ├── src/
-│   ├── face_locking.py     # Main system & UI logic
+│   ├── face_tracker.py     # Core face tracking framework
+│   ├── servo_controller.py # MQTT servo control system
 │   ├── action_detection.py # Blink/Smile/Movement algorithms
 │   ├── recognize.py        # Core recognition & caching
 │   └── enroll.py           # Face database management
 ├── data/
 │   ├── db/                 # Face embeddings (.npz)
+│   ├── enroll/             # User enrollment folders
 │   └── history/            # Generated action logs
 └── models/                 # ONNX model files
 ```
 
 ---
 
-## 🤝 Contributing
+## MQTT Integration
 
-Contributions make the open-source community an amazing place to learn, inspire, and create. Any contributions you make are **greatly appreciated**. Please see [CONTRIBUTING.md](CONTRIBUTING.md) for details.
+The system includes comprehensive MQTT servo control:
+- **P-Controller**: Smooth servo positioning based on face location
+- **Auto-Scan Mode**: Servo scanning when no face is detected
+- **Auto-Stop on Lock**: Immediate centering when target face is locked
+- **Configurable Parameters**: Adjust servo gains, scan speed, and angles
+
+MQTT Topics:
+- `vision/team351/movement` - Servo angle commands
+- `robot/status` - System status messages
+- `servo/status` - Servo feedback
 
 ---
 
-## 📜 License
+## Database Administration
 
-Distributed under the MIT License. See `LICENSE` for more information.# automatic-face-tracking
+Use `admin_merged.py` for comprehensive database management:
+
+### Features:
+- **User Management**: List, search, and delete users
+- **Cascade Deletion**: Remove users and all associated data (photos, enrollment folders, history)
+- **Data Cleaning**: Clean orphaned photos, old history files, cache files
+- **Storage Analysis**: Analyze disk usage and identify large files
+- **Backup Management**: Automatic backups before modifications
+
+### Usage:
+```bash
+python admin_merged.py
+```
+
+### Key Options:
+1. List all users with enrollment folder status
+2. Delete user (database only)
+3. Delete user (CASCADE - all data)
+4. Data cleaning menu
+5. Storage analysis
+
+---
+
+## Architecture
+
+The system has been refactored into a modular architecture:
+
+### Core Components:
+- **FaceTracker**: Base face tracking framework with callback system
+- **ServoController**: MQTT servo control with P-controller
+- **FaceLockingApp**: Application layer with UI integration
+
+### Benefits:
+- **Modularity**: Each component has a single responsibility
+- **Reusability**: Components can be used for different applications
+- **Maintainability**: Easy to test and extend individual modules
+- **Extensibility**: Callback system allows custom behaviors
+
+---
+
+## Contributing
+
+Contributions make the open-source community an amazing place to learn, inspire, and create. Any contributions you make are greatly appreciated. Please see [CONTRIBUTING.md](CONTRIBUTING.md) for details.
+
+---
+
+## License
+
+Distributed under the MIT License. See `LICENSE` for more information.
