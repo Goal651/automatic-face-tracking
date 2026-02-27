@@ -84,8 +84,16 @@ We have implemented several techniques to ensure zero lag:
 | **C** | Toggle Confidence Display |
 | **D** | Toggle Detailed UI |
 | **[/]** | Adjust Window Scaling |
-| **S** | Save Action History |
+| **W/S** | Increase/Decrease Window Size |
+| **F** | Toggle Fullscreen Mode |
+| **A** | Save Action History |
 | **P** | Toggle MQTT Publishing |
+
+### Window Features:
+- **Resizable Window** - Drag edges or use W/S keys
+- **Fullscreen Mode** - Press F to toggle
+- **Dynamic Scaling** - Adjust window size with keyboard
+- **Manual Resizing** - Window is fully resizable with mouse
 
 ---
 

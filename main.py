@@ -420,13 +420,20 @@ class FaceTracker:
         db = load_db_npz(Path(config.db_path))
         self.matcher = FaceDBMatcher(db=db, dist_thresh=0.4)
         
-        # Verify target identity exists
-        if config.target_identity not in db:
-            available = list(db.keys())
-            raise ValueError(
-                f"Target identity '{config.target_identity}' not found in database. "
-                f"Available: {available}"
-            )
+        # Check if target identity exists
+        if self.config.target_identity is not None:
+            if self.config.target_identity not in db:
+                available_users = list(db.keys())
+                raise ValueError(
+                    f"Target identity '{self.config.target_identity}' not found in database. "
+                    f"Available: {available_users}"
+                )
+        
+        print("Face Tracker initialized")
+        if self.config.target_identity:
+            print(f"Target identity: {self.config.target_identity}")
+        else:
+            print("Demo mode - no target identity set")
         
         # Tracking state
         self.tracking_state: Optional[FaceTrackingState] = None
@@ -927,38 +934,80 @@ class FaceLockingApp:
 
 
 # ============================================================================
-# MAIN ENTRY POINT
 # ============================================================================
 
 def main():
     """Main application entry point"""
+    import sys
     
-    # Configuration
-    target_identity = "Wilson"
+    # Load database to get available users
     db_path = "data/db/face_db.npz"
-    model_path = "models/embedder_arcface.onnx"
+    available_users = []
+    
+    try:
+        db = load_db_npz(Path(db_path))
+        available_users = list(db.keys())
+    except Exception as e:
+        print(f"Warning: Could not load database: {e}")
+        available_users = []
+    
+    # Handle user selection
+    target_identity = None
+    
+    if not available_users:
+        print("No users found in database!")
+        print("Please enroll a user first:")
+        print("  python -m src.enroll")
+        print("\nOr continue with demo mode (no face locking)...")
+        choice = input("Continue with demo mode? (y/n): ").lower().strip()
+        if choice != 'y':
+            sys.exit(1)
+        target_identity = None
+    else:
+        print("\nAvailable users in database:")
+        for i, user in enumerate(available_users, 1):
+            print(f"  {i}. {user}")
+        
+        print(f"\nDefault user: {available_users[0]}")
+        choice = input(f"Select user (1-{len(available_users)}) or press Enter for default: ").strip()
+        
+        if choice.isdigit() and 1 <= int(choice) <= len(available_users):
+            target_identity = available_users[int(choice) - 1]
+        else:
+            target_identity = available_users[0]
+        
+        print(f"Selected user: {target_identity}")
+    
+    # Parse command line arguments
     window_scale = 1.0
     mirror_mode = True
+    mqtt_enabled = True
     
-    # MQTT configuration
-    mqtt_config = ServoConfig(
-        broker="localhost",
-        port=1883,
-        topic_movement="vision/team351/movement",
-        topic_status="robot/status",
-        topic_servo_status="servo/status",
-        servo_Kp=60.0,
-        servo_ema_alpha=0.45,
-        auto_stop_on_lock=True,
-        scan_enabled=True,
-        scan_speed=30.0
-    )
+    if len(sys.argv) > 1:
+        try:
+            window_scale = float(sys.argv[1])
+        except ValueError:
+            pass
+    
+    if len(sys.argv) > 2:
+        mirror_mode = sys.argv[2].lower() != 'false'
+    
+    if len(sys.argv) > 3:
+        mqtt_enabled = sys.argv[3].lower() != 'false'
+    
+    # Initialize MQTT config
+    mqtt_config = None
+    if mqtt_enabled:
+        try:
+            mqtt_config = ServoConfig()
+        except Exception as e:
+            print(f"Warning: MQTT initialization failed: {e}")
+            print("Continuing without servo control...")
+            mqtt_config = None
     
     # Initialize application
     app = FaceLockingApp(
         target_identity=target_identity,
-        db_path=db_path,
-        model_path=model_path,
         window_scale=window_scale,
         mirror_mode=mirror_mode,
         mqtt_config=mqtt_config
@@ -967,124 +1016,108 @@ def main():
     # Initialize camera
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
-        raise RuntimeError("Camera not available")
+        print("Error: Could not open camera")
+        return
     
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    cap.set(cv2.CAP_PROP_FPS, 30)
+    # Create resizable window
+    window_name = 'Face Locking System'
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, int(1280 * window_scale), int(720 * window_scale))
     
-    print("Face Locking Application started")
-    print("Controls:")
-    print("  q: quit")
-    print("  r: reload database")
-    print("  l: toggle lock on/off")
-    print("  +/-: adjust smile detection threshold")
-    print("  F1/F2: adjust face detection sensitivity")
-    print("  m: toggle mirror mode")
-    print("  M: toggle landmarks display")
-    print("  C: toggle confidence display")
-    print("  d: toggle detailed UI information")
-    print("  [/]: adjust window scaling")
-    print("  s: save action history")
-    print("  p: toggle MQTT publishing")
+    # Enable window resizing (not fullscreen)
+    cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
     
     # Main loop
-    last_time = time.time()
-    frame_count = 0
-    fps = 0
+    print("\n=== Face Locking System ===")
+    print("Controls:")
+    print("  Q - Quit")
+    print("  R - Reload database")
+    print("  L - Toggle lock on target")
+    print("  D - Toggle detailed UI")
+    print("  M - Toggle mirror mode")
+    print("  C - Toggle confidence display")
+    print("  +/- - Adjust smile threshold")
+    print("  F1/F2 - Adjust face detection sensitivity")
+    print("  [/] - Adjust window scale")
+    print("  W/S - Increase/Decrease window size")
+    print("  F - Toggle fullscreen")
+    print("  A - Save action history")
+    print("  P - Toggle MQTT publishing")
+    
+    if target_identity:
+        print(f"\nTarget: {target_identity}")
+        print("Press 'L' to lock onto target face")
+    else:
+        print("\nDemo mode - no target user selected")
     
     try:
         while True:
             ret, frame = cap.read()
             if not ret:
-                print("Failed to read from camera")
+                print("Error: Could not read frame")
                 break
             
+            # Process frame
             processed_frame = app.process_frame(frame)
             
-            # Calculate FPS
-            frame_count += 1
-            current_time = time.time()
-            if current_time - last_time >= 1.0:
-                fps = frame_count / (current_time - last_time)
-                frame_count = 0
-                last_time = current_time
+            # Display
+            cv2.imshow(window_name, processed_frame)
             
-            cv2.putText(processed_frame, f"FPS: {fps:.1f}", (10, processed_frame.shape[0] - 10),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            
-            cv2.imshow("Face Locking System", processed_frame)
-            
+            # Handle keyboard
             key = cv2.waitKey(1) & 0xFF
             
-            if key == ord('q'):
+            if key == ord('q') or key == 27:  # Q or ESC
                 break
             elif key == ord('r'):
-                try:
-                    app.tracker.matcher.reload_from(Path(db_path))
-                    app.tracker.identity_cache.clear()
-                    print("📁 Database reloaded")
-                except Exception as e:
-                    print(f"❌ Failed to reload database: {e}")
-            
+                app.reload_database()
             elif key == ord('l'):
                 app.toggle_lock()
-            
-            elif key in (ord('+'), ord('=')):
-                current_threshold = app.tracker.action_detector.smile_ratio_threshold
-                new_threshold = min(2.0, current_threshold + 0.1)
-                app.tracker.action_detector.smile_ratio_threshold = new_threshold
-                print(f"😊 Smile threshold: {new_threshold:.2f}")
-            
-            elif key == ord('-'):
-                current_threshold = app.tracker.action_detector.smile_ratio_threshold
-                new_threshold = max(0.5, current_threshold - 0.1)
-                app.tracker.action_detector.smile_ratio_threshold = new_threshold
-                print(f"😊 Smile threshold: {new_threshold:.2f}")
-            
-            elif key == ord('m'):
-                app.tracking_config.mirror_mode = not app.tracking_config.mirror_mode
-                status = "ON" if app.tracking_config.mirror_mode else "OFF"
-                print(f"🪞 Mirror mode: {status}")
-            
-            elif key == ord('M'):
-                app.show_landmarks = not app.show_landmarks
-                status = "ON" if app.show_landmarks else "OFF"
-                print(f"📍 Landmarks: {status}")
-            
-            elif key == ord('C'):
-                app.show_confidence = not app.show_confidence
-                status = "ON" if app.show_confidence else "OFF"
-                print(f"📊 Confidence: {status}")
-            
             elif key == ord('d'):
-                app.show_detailed_info = not app.show_detailed_info
-                status = "ON" if app.show_detailed_info else "OFF"
-                print(f"📋 Detailed info: {status}")
-            
+                app.toggle_detailed_info()
+            elif key == ord('m'):
+                app.toggle_mirror_mode()
+            elif key == ord('c'):
+                app.toggle_confidence_display()
+            elif key == ord('+') or key == ord('='):
+                app.adjust_smile_threshold(0.05)
+            elif key == ord('-') or key == ord('_'):
+                app.adjust_smile_threshold(-0.05)
             elif key == ord('['):
-                app.tracking_config.window_scale = max(0.5, app.tracking_config.window_scale - 0.1)
-                print(f"🔍 Window scale: {app.tracking_config.window_scale:.1f}x")
-            
+                app.adjust_window_scale(0.8)
             elif key == ord(']'):
-                app.tracking_config.window_scale = min(2.0, app.tracking_config.window_scale + 0.1)
-                print(f"🔍 Window scale: {app.tracking_config.window_scale:.1f}x")
-            
-            elif key == ord('s'):
-                try:
-                    filepath = app.save_action_history()
-                    print(f"💾 Action history saved")
-                except Exception as e:
-                    print(f"❌ Failed to save history: {e}")
-            
-            elif key == ord('p'):
-                if app.servo.enabled:
-                    app.servo.disable()
-                    print("📡 MQTT publishing: OFF")
+                app.adjust_window_scale(1.2)
+            elif key == ord('w') or key == ord('W'):
+                # Increase window size
+                current_size = cv2.getWindowImageRect(window_name)
+                new_width = int(current_size[2] * 1.1)
+                new_height = int(current_size[3] * 1.1)
+                cv2.resizeWindow(window_name, new_width, new_height)
+                print(f"Window resized to: {new_width}x{new_height}")
+            elif key == ord('s') or key == ord('S'):
+                # Decrease window size
+                current_size = cv2.getWindowImageRect(window_name)
+                new_width = int(current_size[2] * 0.9)
+                new_height = int(current_size[3] * 0.9)
+                if new_width > 400 and new_height > 300:  # Minimum size
+                    cv2.resizeWindow(window_name, new_width, new_height)
+                    print(f"Window resized to: {new_width}x{new_height}")
+            elif key == ord('f') or key == ord('F'):
+                # Toggle fullscreen
+                current_prop = cv2.getWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN)
+                if current_prop == cv2.WINDOW_FULLSCREEN:
+                    cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
+                    print("Fullscreen OFF")
                 else:
-                    app.servo.enable()
-                    print("📡 MQTT publishing: ON")
-            
+                    cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+                    print("Fullscreen ON")
+            elif key == ord('a') or key == ord('A'):
+                app.save_action_history()
+            elif key == ord('p'):
+                app.toggle_mqtt_publishing()
+            elif key == ord('1'):
+                app.adjust_face_sensitivity(-10)
+            elif key == ord('2') and key != ord('l'):  # F2
+                app.adjust_face_sensitivity(10)
             elif key == 0xFFBE:  # F1
                 current_min = app.tracker.detector.min_size
                 new_min = (max(50, current_min[0] - 10), max(50, current_min[1] - 10))
