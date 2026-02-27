@@ -172,6 +172,9 @@ class ServoController:
         # Initialize MQTT
         self._init_mqtt()
         
+        # Initialize action detector for advanced movement tracking
+        self.action_detector = AdvancedActionDetector()
+        
         print(f"Servo Controller initialized")
         print(f"MQTT Broker: {config.broker}:{config.port}")
         print(f"Movement Topic: {config.topic_movement}")
@@ -250,34 +253,69 @@ class ServoController:
     
     def update_face_tracking(self, face_center: Tuple[int, int], frame_size: Tuple[int, int], 
                            is_locked: bool, confidence: float) -> Optional[int]:
-        """Update servo position based on face tracking"""
+        """Update servo position based on face tracking using advanced movement detection"""
         if not self.enabled or confidence < self.config.confidence_threshold:
             return None
         
         frame_width, frame_height = frame_size
         face_x, face_y = face_center
-        normalized_x = (face_x - frame_width / 2) / (frame_width / 2)
         
-        # Auto-stop on lock
-        if self.config.auto_stop_on_lock and is_locked and not self._lock_centering_complete:
-            self.center_servo()
-            self._lock_centering_complete = True
-            return self.config.servo_center_angle
+        # Use advanced movement detection for smoother control
+        movement_info = self.action_detector.detect_movement_advanced(face_center, time.time())
         
-        # Check if face is centered
-        if abs(normalized_x) <= self.config.centering_tolerance:
-            self._centered_stable_frames += 1
-            if self._centered_stable_frames >= self.config.centering_stability_threshold:
+        if movement_info:
+            # Extract movement metrics
+            velocity_x = movement_info['velocity']
+            speed = movement_info['speed']
+            direction = movement_info['direction']
+            displacement = movement_info['displacement']
+            
+            # Enhanced control using velocity and speed
+            # Normalize velocity to servo control range
+            max_velocity = 200.0  # pixels per second
+            normalized_velocity = np.clip(velocity_x / max_velocity, -1.0, 1.0)
+            
+            # Apply speed factor for more responsive control
+            speed_factor = min(2.0, 1.0 + speed / 100.0)
+            control_signal = self.config.servo_Kp * normalized_velocity * speed_factor
+            
+            # Auto-stop on lock: center immediately on first lock
+            if self.config.auto_stop_on_lock and is_locked and not self._lock_centering_complete:
+                self.center_servo()
                 self._lock_centering_complete = True
+                return self.config.servo_center_angle
+            
+            # Check if face is centered using displacement
+            if abs(displacement[0]) <= self.config.centering_tolerance * frame_width:
+                self._centered_stable_frames += 1
+                if self._centered_stable_frames >= self.config.centering_stability_threshold:
+                    self._lock_centering_complete = True
+            else:
+                self._centered_stable_frames = 0
+                self._lock_centering_complete = False
+            
         else:
-            self._centered_stable_frames = 0
-            self._lock_centering_complete = False
+            # Fallback to basic position tracking if no movement detected
+            normalized_x = (face_x - frame_width / 2) / (frame_width / 2)
+            error = -normalized_x
+            control_signal = self.config.servo_Kp * error
+            
+            # Auto-stop on lock
+            if self.config.auto_stop_on_lock and is_locked and not self._lock_centering_complete:
+                self.center_servo()
+                self._lock_centering_complete = True
+                return self.config.servo_center_angle
+            
+            # Check if face is centered
+            if abs(normalized_x) <= self.config.centering_tolerance:
+                self._centered_stable_frames += 1
+                if self._centered_stable_frames >= self.config.centering_stability_threshold:
+                    self._lock_centering_complete = True
+            else:
+                self._centered_stable_frames = 0
+                self._lock_centering_complete = False
         
-        # P-controller
-        error = -normalized_x
-        control_signal = self.config.servo_Kp * error
-        
-        # EMA smoothing
+        # Apply EMA smoothing
         if self._target_servo_angle is not None:
             smoothed_signal = (self.config.servo_ema_alpha * control_signal + 
                              (1 - self.config.servo_ema_alpha) * 
@@ -285,15 +323,20 @@ class ServoController:
         else:
             smoothed_signal = control_signal
         
+        # Calculate target angle
         target_angle = self._current_servo_angle + smoothed_signal
+        
+        # Clamp to servo limits
         target_angle = max(self.config.servo_min_angle, 
                           min(self.config.servo_max_angle, target_angle))
         
         self._target_servo_angle = target_angle
         self._scanning = False
         
+        # Publish angle command
         angle_int = int(round(target_angle))
         self._publish_angle(angle_int)
+        
         return angle_int
     
     def update_scan_mode(self, current_time: float) -> Optional[int]:

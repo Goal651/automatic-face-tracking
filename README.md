@@ -52,9 +52,12 @@ rm buffalo_l.zip *.onnx
 
 ### 3. Usage
 - **Enroll a User**: `python -m src.enroll` (Capture face samples for the database)
-- **Run Locking System**: `python main.py` (Main interface with servo control)
+- **Run Locking System**: `python main.py` (Main interface with advanced servo control)
 - **Run Recognition**: `python -m src.recognize` (Multi-face demo)
-- **Database Administration**: `python admin_merged.py` (Advanced management tools)
+- **Database Administration**: `python admin.py` (Advanced management tools)
+- **Test Utilities**: `python -m src.utils` (Camera/face detection tests)
+- **Embedding Tools**: `python -m src.embed` (Face embedding visualization)
+- **Threshold Evaluation**: `python -m src.evaluate` (System performance analysis)
 
 ---
 
@@ -90,13 +93,19 @@ We have implemented several techniques to ensure zero lag:
 
 ```text
 ├── main.py                 # Consolidated main application
-├── admin_merged.py         # Enhanced database administration
+├── admin.py                # Enhanced database administration
 ├── src/
-│   ├── face_tracker.py     # Core face tracking framework
-│   ├── servo_controller.py # MQTT servo control system
-│   ├── action_detection.py # Blink/Smile/Movement algorithms
+│   ├── action_detection.py # Advanced movement, blink, smile detection
 │   ├── recognize.py        # Core recognition & caching
-│   └── enroll.py           # Face database management
+│   ├── enroll.py           # Face database management
+│   ├── embed.py            # Face embedding tools
+│   ├── evaluate.py         # Threshold evaluation
+│   ├── haar_5pt.py         # 5-point alignment
+│   ├── mediapipe_compat.py # MediaPipe compatibility
+│   ├── landmarks.py        # Landmark utilities
+│   ├── serial_comm.py      # Serial communication
+│   ├── align.py            # Face alignment
+│   └── utils.py            # Camera/detection utilities
 ├── data/
 │   ├── db/                 # Face embeddings (.npz)
 │   ├── enroll/             # User enrollment folders
@@ -108,11 +117,13 @@ We have implemented several techniques to ensure zero lag:
 
 ## MQTT Integration
 
-The system includes comprehensive MQTT servo control:
-- **P-Controller**: Smooth servo positioning based on face location
+The system includes comprehensive MQTT servo control with advanced movement detection:
+- **Advanced Movement Detection**: Uses velocity-based control from `action_detection.py`
+- **P-Controller**: Smooth servo positioning based on face movement velocity
 - **Auto-Scan Mode**: Servo scanning when no face is detected
 - **Auto-Stop on Lock**: Immediate centering when target face is locked
 - **Configurable Parameters**: Adjust servo gains, scan speed, and angles
+- **Speed-Responsive Control**: Faster movements result in more responsive servo tracking
 
 MQTT Topics:
 - `vision/team351/movement` - Servo angle commands
@@ -134,7 +145,7 @@ Use `admin_merged.py` for comprehensive database management:
 
 ### Usage:
 ```bash
-python admin_merged.py
+python admin.py
 ```
 
 ### Key Options:
