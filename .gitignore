@@ -2,3 +2,5 @@
 models/embedder_arcface.onnx
 history/
 data/
+__pycache__/
+*.pyc
