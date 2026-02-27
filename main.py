@@ -58,6 +58,9 @@ from src.haar_5pt import align_face_5pt
 from src.face_detector import RobustFaceDetector, FaceDetectionResult
 from src.action_detection import AdvancedActionDetector, ActionClassifier
 
+# Import the working recognition system
+from src.recognize import HaarFaceMesh5pt as WorkingFaceDetector
+
 
 # ============================================================================
 # CONFIGURATION
@@ -423,6 +426,12 @@ class FaceTracker:
         )
         self.embedder = ArcFaceEmbedderONNX(model_path=config.model_path, debug=False)
         
+        # Use the working recognition system from recognize.py
+        self.working_detector = WorkingFaceDetector(
+            min_size=config.min_face_size,
+            debug=False
+        )
+        
         # Load database and matcher
         db = load_db_npz(Path(config.db_path))
         self.matcher = FaceDBMatcher(db=db, dist_thresh=0.4)
@@ -520,58 +529,107 @@ class FaceTracker:
         return mr
     
     def recognize_all_faces(self, frame: np.ndarray, faces: List[FaceDetectionResult]) -> List[Tuple[FaceDetectionResult, MatchResult]]:
-        """Recognize all detected faces"""
+        """Recognize all detected faces using optimized recognition system"""
         results = []
         
-        for face_det in faces:
-            if not face_det.is_valid:
-                continue
-                
-            mr = self.recognize_face(frame, face_det)
-            results.append((face_det, mr))
+        # Use the working detector from recognize.py with caching
+        working_faces = self.working_detector.detect(frame, max_faces=10)
+        
+        # Process each face with optimized recognition
+        for working_face in working_faces:
+            center = ((working_face.x1 + working_face.x2) // 2, (working_face.y1 + working_face.y2) // 2)
+            
+            # Check cache first for performance
+            mr = None
+            needs_recognition = self.frame_count % 10 == 0  # Recognize every 10 frames
+            
+            if not needs_recognition:
+                # Check cache for existing recognition
+                for pos, (cached_mr, last_fidx) in self.identity_cache.items():
+                    dist = np.sqrt((center[0] - pos[0])**2 + (center[1] - pos[1])**2)
+                    if dist < 80:  # 80 pixel threshold
+                        mr = cached_mr
+                        break
+            
+            # Only do heavy recognition if needed
+            if mr is None or needs_recognition:
+                try:
+                    aligned, _ = align_face_5pt(frame, working_face.kps, out_size=(112, 112))
+                    emb = self.embedder.embed(aligned)
+                    mr = self.matcher.match(emb)
+                    self.identity_cache[center] = (mr, self.frame_count)
+                except Exception as e:
+                    print(f"Recognition error: {e}")
+                    mr = MatchResult(name=None, distance=1.0, similarity=0.0, accepted=False)
+            
+            # Convert FaceDet to FaceDetectionResult format
+            face_result = FaceDetectionResult(
+                x1=working_face.x1,
+                y1=working_face.y1,
+                x2=working_face.x2,
+                y2=working_face.y2,
+                score=working_face.score,
+                kps=working_face.kps,
+                confidence=working_face.score,
+                quality_score=0.8,
+                is_valid=True
+            )
+            
+            results.append((face_result, mr))
         
         return results
     
     def find_target_face(self, frame: np.ndarray, faces: List[FaceDetectionResult]) -> Optional[Tuple[FaceDetectionResult, MatchResult]]:
-        """Find target face among detected faces"""
-        if not faces or self.config.target_identity is None:
+        """Find target face among detected faces using optimized recognition system"""
+        if self.config.target_identity is None:
             return None
         
-        target_face = None
-        target_match = None
+        # Use the working detector from recognize.py
+        working_faces = self.working_detector.detect(frame, max_faces=10)
         
-        # Sort faces by quality (best first)
-        valid_faces = [f for f in faces if f.is_valid]
-        valid_faces.sort(key=lambda f: f.quality_score, reverse=True)
-        
-        for face_det in valid_faces:
-            center = ((face_det.x + face_det.x + face_det.width) // 2, 
-                      (face_det.y + face_det.y + face_det.height) // 2)
+        for working_face in working_faces:
+            center = ((working_face.x1 + working_face.x2) // 2, (working_face.y1 + working_face.y2) // 2)
             
+            # Check cache first for performance
             mr = None
-            needs_recognition = self.frame_count % self.config.recognition_interval == 0
+            needs_recognition = self.frame_count % 5 == 0  # Recognize target every 5 frames (more frequent)
             
-            # Check cache first
-            for pos, (cached_mr, last_fidx) in self.identity_cache.items():
-                dist = np.sqrt((center[0] - pos[0])**2 + (center[1] - pos[1])**2)
-                if dist < self.cache_distance_threshold:
-                    mr = cached_mr
-                    break
+            if not needs_recognition:
+                # Check cache for existing recognition
+                for pos, (cached_mr, last_fidx) in self.identity_cache.items():
+                    dist = np.sqrt((center[0] - pos[0])**2 + (center[1] - pos[1])**2)
+                    if dist < 80:  # 80 pixel threshold
+                        mr = cached_mr
+                        break
             
-            # If not in cache or needs recognition
+            # Only do heavy recognition if needed
             if mr is None or needs_recognition:
-                aligned, _ = align_face_5pt(frame, face_det.kps, out_size=(112, 112))
-                emb = self.embedder.embed(aligned)
-                mr = self.matcher.match(emb)
-                self.identity_cache[center] = (mr, self.frame_count)
+                try:
+                    aligned, _ = align_face_5pt(frame, working_face.kps, out_size=(112, 112))
+                    emb = self.embedder.embed(aligned)
+                    mr = self.matcher.match(emb)
+                    self.identity_cache[center] = (mr, self.frame_count)
+                except Exception as e:
+                    print(f"Target recognition error: {e}")
+                    continue
             
             # Check if this is our target
             if mr.accepted and mr.name == self.config.target_identity:
-                target_face = face_det
-                target_match = mr
-                break
+                # Convert to our format
+                face_result = FaceDetectionResult(
+                    x1=working_face.x1,
+                    y1=working_face.y1,
+                    x2=working_face.x2,
+                    y2=working_face.y2,
+                    score=working_face.score,
+                    kps=working_face.kps,
+                    confidence=working_face.score,
+                    quality_score=0.9,  # High quality for target
+                    is_valid=True
+                )
+                return (face_result, mr)
         
-        return (target_face, target_match) if target_face else None
+        return None
     
     def update_tracking_state(self, face: FaceDet, mr: MatchResult):
         """Update the tracking state with new face data"""
@@ -595,8 +653,8 @@ class FaceTracker:
         
         self._trigger_callbacks('on_face_detected', face, mr, self.tracking_state)
     
-    def detect_actions(self, face: FaceDet, frame_time: float) -> List[ActionRecord]:
-        """Detect actions on the tracked face"""
+    def detect_actions(self, face: FaceDetectionResult, frame_time: float) -> List[ActionRecord]:
+        """Detect actions for a face (smile and movement only, no blinking)"""
         if self.tracking_state is None:
             return []
         
@@ -617,20 +675,7 @@ class FaceTracker:
                     value=movement_info.get('speed', 0)
                 ))
         
-        # Blink detection
-        blink_detected, eye_metrics = self.action_detector.detect_blink_advanced(face.kps, frame_time)
-        if blink_detected:
-            action_type = "eye_blink"
-            if self.action_classifier.should_record_action(action_type, frame_time):
-                description = self.action_classifier.get_action_description(action_type, eye_metrics)
-                actions.append(ActionRecord(
-                    timestamp=time.strftime("%Y-%m-%d %H:%M:%S"),
-                    action_type=action_type,
-                    description=description,
-                    value=eye_metrics.avg_eye_ratio
-                ))
-        
-        # Smile detection
+        # Smile detection (but no blinking)
         smile_detected, mouth_metrics = self.action_detector.detect_smile_advanced(face.kps, frame_time)
         if smile_detected and not self.tracking_state.smile_state:
             action_type = "smile"
@@ -677,18 +722,40 @@ class FaceTracker:
         return False
     
     def process_frame(self, frame: np.ndarray) -> Dict[str, Any]:
-        """Process a single frame and return tracking results"""
+        """Process a single frame and return tracking results (optimized)"""
+        start_time = time.time()
         self.frame_count += 1
         frame_time = time.time()
         
-        faces = self.detect_faces(frame)
-        target_result = None
+        # Use the working detector from recognize.py for face detection (only once)
+        working_faces = self.working_detector.detect(frame, max_faces=10)
         
-        # Recognize ALL faces in the frame
-        all_recognitions = self.recognize_all_faces(frame, faces)
+        # Convert working faces to our format for visualization
+        faces = []
+        for working_face in working_faces:
+            face_result = FaceDetectionResult(
+                x1=working_face.x1,
+                y1=working_face.y1,
+                x2=working_face.x2,
+                y2=working_face.y2,
+                score=working_face.score,
+                kps=working_face.kps,
+                confidence=working_face.score,
+                quality_score=0.8,
+                is_valid=True
+            )
+            faces.append(face_result)
         
-        if faces:
-            target_result = self.find_target_face(frame, faces)
+        # Find target face first (more frequent recognition)
+        target_result = self.find_target_face(frame, faces)
+        
+        # Only recognize all faces if we need detailed info (less frequent)
+        all_recognitions = []
+        if self.frame_count % 15 == 0:  # Every 15 frames for full recognition
+            all_recognitions = self.recognize_all_faces(frame, faces)
+        elif target_result:
+            # If we have target, just add that to recognitions
+            all_recognitions = [target_result]
         
         actions = []
         if target_result:
@@ -698,17 +765,25 @@ class FaceTracker:
         else:
             self.check_lock_timeout()
         
+        # Performance monitoring
+        process_time = (time.time() - start_time) * 1000  # Convert to milliseconds
+        
         result = {
             'faces': faces,
-            'all_recognitions': all_recognitions,  # Add all face recognitions
+            'all_recognitions': all_recognitions,
             'target_face': target_result[0] if target_result else None,
             'match_result': target_result[1] if target_result else None,
             'tracking_state': self.tracking_state,
             'actions': actions,
             'is_locked': self.is_locked,
             'frame_time': frame_time,
-            'frame_count': self.frame_count
+            'frame_count': self.frame_count,
+            'process_time_ms': process_time  # Add performance metric
         }
+        
+        # Show performance info every 60 frames
+        if self.frame_count % 60 == 0:
+            print(f"⚡ Frame processing: {process_time:.1f}ms | Faces: {len(faces)} | Cache: {len(self.identity_cache)}")
         
         self._trigger_callbacks('on_frame_processed', result)
         return result
