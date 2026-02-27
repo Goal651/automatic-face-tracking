@@ -42,6 +42,7 @@ except Exception as e:
 
 # Reuse your known-good alignment method (you said alignment is OK now)
 from .haar_5pt import align_face_5pt
+from .face_detector import RobustFaceDetector, FaceDetectionResult
 
 # ----------------------------------
 # Data
@@ -410,8 +411,11 @@ class FaceDBMatcher:
 def main():
     db_path = Path("data/db/face_db.npz")
 
-    det = HaarFaceMesh5pt(
+    det = RobustFaceDetector(
         min_size=(100, 100),  # Increased min_size to reduce noise
+        confidence_threshold=0.7,
+        quality_threshold=0.3,
+        enable_mediapipe=True,
         debug=False,
     )
 
@@ -448,7 +452,7 @@ def main():
             break
         frame_idx += 1
 
-        faces = det.detect(frame, max_faces=5)
+        faces = det.detect_faces(frame, max_faces=10)  # Increased to handle more faces
         vis = frame.copy()
 
         # compute fps
@@ -494,18 +498,25 @@ def main():
 
             # 2. If not found or interval hit, do heavy recognition
             if mr is None:
-                # align -> embed -> match
-                aligned, _ = align_face_5pt(frame, f.kps, out_size=(112, 112))
-                emb = embedder.embed(aligned)
-                mr = matcher.match(emb)
+                # align -> embed -> match using face detector's alignment
+                try:
+                    aligned, _ = det.align_face(frame, f, out_size=(112, 112))
+                    emb = embedder.embed(aligned)
+                    mr = matcher.match(emb)
 
-                # Update cache
-                identity_cache[center] = (mr, frame_idx)
+                    # Update cache
+                    identity_cache[center] = (mr, frame_idx)
+                except Exception as e:
+                    print(f"Recognition failed: {e}")
+                    continue
             else:
                 # Still need 'aligned' for preview thumbnails if it's new
                 # but we can reuse the cached mr.
                 # Only align if we actually need the thumbnail
-                aligned, _ = align_face_5pt(frame, f.kps, out_size=(112, 112))
+                try:
+                    aligned, _ = det.align_face(frame, f, out_size=(112, 112))
+                except Exception:
+                    continue
 
             # label
             label = mr.name if mr.name is not None else "Unknown"
@@ -517,27 +528,17 @@ def main():
 
             # draw bbox + kps
             cv2.rectangle(vis, (f.x1, f.y1), (f.x2, f.y2), color, 2)
-            for x, y in f.kps.astype(int):
-                cv2.circle(vis, (int(x), int(y)), 2, color, -1)
+            for (x, y) in f.kps.astype(int):
+                cv2.circle(vis, (int(x), int(y)), 2, (255, 255, 255), -1)
 
-            cv2.putText(
-                vis,
-                line1,
-                (f.x1, max(0, f.y1 - 28)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                color,
-                2,
-            )
-            cv2.putText(
-                vis,
-                line2,
-                (f.x1, max(0, f.y1 - 6)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                color,
-                2,
-            )
+            # draw text
+            cv2.putText(vis, line1, (f.x1, max(0, f.y1 - 25)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+            cv2.putText(vis, line2, (f.x1, max(0, f.y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+            # show quality score if available
+            if hasattr(f, 'quality_score'):
+                quality_text = f"Q={f.quality_score:.2f}"
+                cv2.putText(vis, quality_text, (f.x1, f.y2 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
 
             # aligned preview thumbnails (stack)
             if y0 + thumb <= h and shown < 4:

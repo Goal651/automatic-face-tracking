@@ -36,7 +36,7 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
-from .haar_5pt import Haar5ptDetector, align_face_5pt
+from .face_detector import RobustFaceDetector, FaceDetectionResult
 from .embed import ArcFaceEmbedderONNX
 
 # ----------------------------------
@@ -168,8 +168,15 @@ def main():
         print("No name provided. Exiting.")
         return
 
-    # Pipeline (your working practical stack)
-    det = Haar5ptDetector(min_size=(70, 70), smooth_alpha=0.80, debug=False)
+    # Pipeline (using robust face detector)
+    det = RobustFaceDetector(
+        min_size=(70, 70),
+        confidence_threshold=0.7,
+        quality_threshold=0.3,
+        enable_mediapipe=True,
+        smooth_alpha=0.80,
+        debug=False
+    )
     emb = ArcFaceEmbedderONNX(model_path="models/embedder_arcface.onnx", input_size=(112, 112), debug=False)
 
     db = load_db(cfg)
@@ -188,7 +195,7 @@ def main():
     auto = False
     last_auto = 0.0
 
-    cap = cv2.VideoCapture(1)
+    cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         raise RuntimeError("Failed to open camera.")
     
@@ -213,20 +220,26 @@ def main():
                 break
 
             vis = frame.copy()
-            faces = det.detect(frame, max_faces=1)
+            faces = det.detect_faces(frame, max_faces=1)
 
             aligned: Optional[np.ndarray] = None
 
             if faces:
                 f = faces[0]
 
-                # draw hbox + kps
+                # draw bbox + landmarks
                 cv2.rectangle(vis, (f.x1, f.y1), (f.x2, f.y2), (0, 255, 0), 2)
                 for (x, y) in f.kps.astype(int):
                     cv2.circle(vis, (int(x), int(y)), 3, (0, 255, 0), -1)
 
-                aligned, _ = align_face_5pt(frame, f.kps, out_size=(112, 112))
-                cv2.imshow(cfg.window_aligned, aligned)
+                # Use face detector's alignment method
+                try:
+                    aligned, _ = det.align_face(frame, f, out_size=(112, 112))
+                    cv2.imshow(cfg.window_aligned, aligned)
+                except Exception as e:
+                    if cfg.debug:
+                        print(f"Alignment failed: {e}")
+                    cv2.imshow(cfg.window_aligned, np.zeros((112, 112, 3), dtype=np.uint8))
             else:
                 cv2.imshow(cfg.window_aligned, np.zeros((112, 112, 3), dtype=np.uint8))
 

@@ -55,6 +55,7 @@ from src.recognize import (
     _kps_span_ok,
 )
 from src.haar_5pt import align_face_5pt
+from src.face_detector import RobustFaceDetector, FaceDetectionResult
 from src.action_detection import AdvancedActionDetector, ActionClassifier
 
 
@@ -265,8 +266,8 @@ class ServoController:
         
         if movement_info:
             # Extract movement metrics
-            velocity_x = movement_info['velocity']
-            speed = movement_info['speed']
+            velocity_x, velocity_y = movement_info['velocity']  # Extract x component
+            speed = float(movement_info['speed'])  # Convert to float
             direction = movement_info['direction']
             displacement = movement_info['displacement']
             
@@ -413,7 +414,13 @@ class FaceTracker:
         self.frame_count = 0
         
         # Initialize core components
-        self.detector = HaarFaceMesh5pt(min_size=config.min_face_size, debug=False)
+        self.detector = RobustFaceDetector(
+            min_size=config.min_face_size,
+            confidence_threshold=0.7,
+            quality_threshold=0.3,
+            enable_mediapipe=True,
+            debug=False
+        )
         self.embedder = ArcFaceEmbedderONNX(model_path=config.model_path, debug=False)
         
         # Load database and matcher
@@ -476,30 +483,33 @@ class FaceTracker:
             except Exception as e:
                 print(f"Callback error for {event}: {e}")
     
-    def detect_faces(self, frame: np.ndarray) -> List[FaceDet]:
-        """Detect all faces in frame"""
-        return self.detector.detect(frame, max_faces=5)
+    def detect_faces(self, frame: np.ndarray) -> List[FaceDetectionResult]:
+        """Detect faces using robust detector"""
+        return self.detector.detect_faces(frame, max_faces=10)  # Increased to 10 faces
     
-    def recognize_face(self, frame: np.ndarray, face_det: FaceDet) -> MatchResult:
+    def recognize_face(self, frame: np.ndarray, face_det: FaceDetectionResult) -> MatchResult:
         """Recognize a specific face with caching optimization"""
-        center = ((face_det.x1 + face_det.x2) // 2, (face_det.y1 + face_det.y2) // 2)
+        if not face_det.is_valid:
+            return MatchResult(name=None, distance=1.0, similarity=0.0, accepted=False)
+        
+        center = ((face_det.x + face_det.x + face_det.width) // 2, 
+                  (face_det.y + face_det.y + face_det.height) // 2)
         
         mr = None
         needs_recognition = self.frame_count % self.config.recognition_interval == 0
         
         # Clean old cache entries
         self.identity_cache = {
-            pos: val
-            for pos, val in self.identity_cache.items()
-            if self.frame_count - val[1] < 5
+            pos: (cached_mr, last_fidx)
+            for pos, (cached_mr, last_fidx) in self.identity_cache.items()
+            if self.frame_count - last_fidx < 5
         }
         
-        if not needs_recognition:
-            for pos, (cached_mr, last_fidx) in self.identity_cache.items():
-                dist = np.sqrt((center[0] - pos[0])**2 + (center[1] - pos[1])**2)
-                if dist < self.cache_distance_threshold:
-                    mr = cached_mr
-                    break
+        for pos, (cached_mr, last_fidx) in self.identity_cache.items():
+            dist = np.sqrt((center[0] - pos[0])**2 + (center[1] - pos[1])**2)
+            if dist < self.cache_distance_threshold:
+                mr = cached_mr
+                break
         
         if mr is None:
             aligned, _ = align_face_5pt(frame, face_det.kps, out_size=(112, 112))
@@ -509,13 +519,59 @@ class FaceTracker:
         
         return mr
     
-    def find_target_face(self, frame: np.ndarray, faces: List[FaceDet]) -> Optional[Tuple[FaceDet, MatchResult]]:
-        """Find the target identity among detected faces"""
-        for face in faces:
-            mr = self.recognize_face(frame, face)
+    def recognize_all_faces(self, frame: np.ndarray, faces: List[FaceDetectionResult]) -> List[Tuple[FaceDetectionResult, MatchResult]]:
+        """Recognize all detected faces"""
+        results = []
+        
+        for face_det in faces:
+            if not face_det.is_valid:
+                continue
+                
+            mr = self.recognize_face(frame, face_det)
+            results.append((face_det, mr))
+        
+        return results
+    
+    def find_target_face(self, frame: np.ndarray, faces: List[FaceDetectionResult]) -> Optional[Tuple[FaceDetectionResult, MatchResult]]:
+        """Find target face among detected faces"""
+        if not faces or self.config.target_identity is None:
+            return None
+        
+        target_face = None
+        target_match = None
+        
+        # Sort faces by quality (best first)
+        valid_faces = [f for f in faces if f.is_valid]
+        valid_faces.sort(key=lambda f: f.quality_score, reverse=True)
+        
+        for face_det in valid_faces:
+            center = ((face_det.x + face_det.x + face_det.width) // 2, 
+                      (face_det.y + face_det.y + face_det.height) // 2)
+            
+            mr = None
+            needs_recognition = self.frame_count % self.config.recognition_interval == 0
+            
+            # Check cache first
+            for pos, (cached_mr, last_fidx) in self.identity_cache.items():
+                dist = np.sqrt((center[0] - pos[0])**2 + (center[1] - pos[1])**2)
+                if dist < self.cache_distance_threshold:
+                    mr = cached_mr
+                    break
+            
+            # If not in cache or needs recognition
+            if mr is None or needs_recognition:
+                aligned, _ = align_face_5pt(frame, face_det.kps, out_size=(112, 112))
+                emb = self.embedder.embed(aligned)
+                mr = self.matcher.match(emb)
+                self.identity_cache[center] = (mr, self.frame_count)
+            
+            # Check if this is our target
             if mr.accepted and mr.name == self.config.target_identity:
-                return face, mr
-        return None
+                target_face = face_det
+                target_match = mr
+                break
+        
+        return (target_face, target_match) if target_face else None
     
     def update_tracking_state(self, face: FaceDet, mr: MatchResult):
         """Update the tracking state with new face data"""
@@ -628,6 +684,9 @@ class FaceTracker:
         faces = self.detect_faces(frame)
         target_result = None
         
+        # Recognize ALL faces in the frame
+        all_recognitions = self.recognize_all_faces(frame, faces)
+        
         if faces:
             target_result = self.find_target_face(frame, faces)
         
@@ -641,12 +700,14 @@ class FaceTracker:
         
         result = {
             'faces': faces,
+            'all_recognitions': all_recognitions,  # Add all face recognitions
             'target_face': target_result[0] if target_result else None,
             'match_result': target_result[1] if target_result else None,
             'tracking_state': self.tracking_state,
             'actions': actions,
             'is_locked': self.is_locked,
-            'frame_time': frame_time
+            'frame_time': frame_time,
+            'frame_count': self.frame_count
         }
         
         self._trigger_callbacks('on_frame_processed', result)
@@ -718,61 +779,101 @@ class FaceLockingApp:
     
     def process_frame(self, frame: np.ndarray) -> np.ndarray:
         """Process a frame and return visualization"""
-        # Store frame size for servo calculations
-        self.frame_size = (frame.shape[1], frame.shape[0])
-        
-        # Mirror if enabled
-        if self.tracking_config.mirror_mode:
-            frame = cv2.flip(frame, 1)
-        
-        # Process frame through tracker
-        result = self.tracker.process_frame(frame)
-        
-        # Create visualization
-        vis_frame = self._create_visualization(frame, result)
-        
-        # Update servo with correct frame size
-        self.servo.process_tracking_update(result, self.frame_size)
-        
-        return vis_frame
+        try:
+            # Store frame size for servo calculations
+            self.frame_size = (frame.shape[1], frame.shape[0])
+            
+            # Mirror if enabled
+            if self.tracking_config.mirror_mode:
+                frame = cv2.flip(frame, 1)
+            
+            # Process frame through tracker
+            result = self.tracker.process_frame(frame)
+            
+            # Create visualization
+            vis_frame = self._create_visualization(frame, result)
+            
+            # Update servo with correct frame size (with error handling)
+            try:
+                self.servo.process_tracking_update(result, self.frame_size)
+            except Exception as e:
+                print(f"Servo update error: {e}")
+                # Continue without servo update
+            
+            return vis_frame
+        except Exception as e:
+            print(f"Frame processing error: {e}")
+            import traceback
+            traceback.print_exc()  # Print full traceback to see where error occurs
+            # Return original frame if processing fails
+            return frame
     
     def _create_visualization(self, frame: np.ndarray, result: Dict[str, Any]) -> np.ndarray:
         """Create visualization with overlays"""
         vis = frame.copy()
         faces = result['faces']
+        all_recognitions = result.get('all_recognitions', [])  # Get all face recognitions
         target_face = result.get('target_face')
         match_result = result.get('match_result')
         tracking_state = result.get('tracking_state')
         actions = result.get('actions', [])
         is_locked = result.get('is_locked', False)
         
-        # Draw all detected faces
-        for i, face in enumerate(faces):
-            if face == target_face and match_result and match_result.accepted:
-                if match_result.name == self.tracking_config.target_identity:
-                    color = (0, 255, 0)  # Green for locked target
-                    status = "LOCKED"
+        # Draw ALL detected and recognized faces
+        for face_det in faces:
+            # Find the recognition result for this face
+            face_recognition = None
+            for f, mr in all_recognitions:
+                if (f.x1 == face_det.x1 and f.y1 == face_det.y1 and 
+                    f.x2 == face_det.x2 and f.y2 == face_det.y2):
+                    face_recognition = (f, mr)
+                    break
+            
+            # Determine color and status
+            if face_recognition:
+                f, mr = face_recognition
+                if mr.accepted:
+                    if mr.name == self.tracking_config.target_identity:
+                        color = (0, 255, 0)  # Green for target
+                        status = f"TARGET: {mr.name}"
+                    else:
+                        color = (0, 255, 255)  # Yellow for known but not target
+                        status = mr.name or "KNOWN"
                 else:
-                    color = (0, 255, 255)  # Yellow for known but not target
-                    status = match_result.name or "UNKNOWN"
+                    color = (255, 0, 0)  # Red for unknown
+                    status = "UNKNOWN"
             else:
-                color = (0, 0, 255)  # Red for unknown
-                status = "UNKNOWN"
+                color = (255, 165, 0)  # Orange for detected but not recognized
+                status = "DETECTED"
             
-            cv2.rectangle(vis, (face.x1, face.y1), (face.x2, face.y2), color, 2)
+            # Draw bounding box
+            cv2.rectangle(vis, (face_det.x1, face_det.y1), (face_det.x2, face_det.y2), color, 2)
             
-            if self.show_landmarks:
-                for x, y in face.kps.astype(int):
-                    cv2.circle(vis, (x, y), 2, color, -1)
+            # Draw landmarks
+            if face_det.kps is not None:
+                for (x, y) in face_det.kps.astype(int):
+                    cv2.circle(vis, (x, y), 2, (255, 255, 255), -1)
             
-            label = f"{i+1}: {status}"
-            cv2.putText(vis, label, (face.x1, face.y1 - 10), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-            
-            if self.show_confidence and match_result and face == target_face:
-                conf_text = f"conf: {match_result.similarity:.3f}"
-                cv2.putText(vis, conf_text, (face.x1, face.y1 - 30),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+            # Draw label with quality score
+            quality_text = f"Q:{face_det.quality_score:.2f}" if hasattr(face_det, 'quality_score') else ""
+            label = f"{status} {quality_text}".strip()
+            cv2.putText(vis, label, (face_det.x1, max(0, face_det.y1 - 10)), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        
+        # Highlight target face if locked
+        if is_locked and target_face and match_result and match_result.accepted:
+            if match_result.name == self.tracking_config.target_identity:
+                # Draw special indicator for locked target
+                center_x = (target_face.x1 + target_face.x2) // 2
+                center_y = (target_face.y1 + target_face.y2) // 2
+                cv2.circle(vis, (center_x, center_y), 50, (0, 255, 0), 3)
+                cv2.putText(vis, "🔒 LOCKED", (target_face.x1, target_face.y2 + 30), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                
+                if self.show_confidence:
+                    conf_text = f"conf: {match_result.similarity:.3f}"
+                    cv2.putText(vis, conf_text, (target_face.x1, target_face.y1 - 30),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
         
         # Draw tracking info
         if is_locked and tracking_state:
@@ -895,7 +996,7 @@ class FaceLockingApp:
                 'timestamp': action.timestamp,
                 'action_type': action.action_type,
                 'description': action.description,
-                'value': action.value
+                'value': float(action.value) if action.value is not None else None
             }
             history_data.append(action_dict)
         
