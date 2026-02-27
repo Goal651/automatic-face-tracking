@@ -1,0 +1,4 @@
+.venv
+models/embedder_arcface.onnx
+history/
+data/
