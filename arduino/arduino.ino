@@ -1,18 +1,18 @@
+#include <ArduinoJson.h>
 #include <ESP8266WiFi.h>
 #include <PubSubClient.h>
-#include <ArduinoJson.h>
 #include <Servo.h>
 
 // WiFi credentials
-const char* ssid = "wigothehacker";
-const char* password = "wigothehacker";
+const char *ssid = "wigothehacker";
+const char *password = "wigothehacker";
 
 // MQTT settings
-const char* mqtt_server = "10.42.0.1";
+const char *mqtt_server = "10.42.0.1";
 const int mqtt_port = 1883;
-const char* mqtt_topic_sub = "vision/team351/movement";  
-const char* mqtt_topic_angle = "servo/angle";           
-const char* mqtt_topic_pub = "servo/status";             
+const char *mqtt_topic_sub = "vision/team351/movement";
+const char *mqtt_topic_angle = "servo/angle";
+const char *mqtt_topic_pub = "servo/status";
 
 // Pin definitions
 const int servoPin = D7;
@@ -50,18 +50,18 @@ void setup_wifi() {
   Serial.println(WiFi.localIP());
 }
 
-void moveServo(int angle, const char* reason) {
+void moveServo(int angle, const char *reason) {
   if (angle >= minAngle && angle <= maxAngle) {
     Serial.print("Moving servo to: ");
     Serial.print(angle);
     Serial.print("° - Reason: ");
     Serial.println(reason);
-    
+
     myServo.write(angle);
     currentAngle = angle;
-    
-    // Publish movement confirmation
-    String statusMsg = "Moved to " + String(angle) + "° due to: " + String(reason);
+
+    // Publish angle for Python feedback loop
+    String statusMsg = "ANGLE:" + String(angle);
     client.publish(mqtt_topic_pub, statusMsg.c_str());
   } else {
     Serial.print("Invalid angle: ");
@@ -69,8 +69,8 @@ void moveServo(int angle, const char* reason) {
   }
 }
 
-void handleMovementMessage(const char* status, int angle, float confidence, 
-                          long timestamp, int frame, const char* target) {
+void handleMovementMessage(const char *status, int angle, float confidence,
+                           long timestamp, int frame, const char *target) {
   Serial.print("Status: ");
   Serial.print(status);
   Serial.print(" | Angle: ");
@@ -81,7 +81,7 @@ void handleMovementMessage(const char* status, int angle, float confidence,
   Serial.print(target);
   Serial.print(" | Frame: ");
   Serial.println(frame);
-  
+
   // Move servo to the exact angle from the message
   char reason[100];
   sprintf(reason, "%s (conf: %.2f, target: %s)", status, confidence, target);
@@ -94,12 +94,12 @@ void handleAngleCommand(int angle) {
   moveServo(angle, reason);
 }
 
-void callback(char* topic, byte* payload, unsigned int length) {
+void callback(char *topic, byte *payload, unsigned int length) {
   Serial.println();
   Serial.println("========== MQTT Message Received ==========");
   Serial.print("Topic: ");
   Serial.println(topic);
-  
+
   // Convert payload to string
   String message;
   for (int i = 0; i < length; i++) {
@@ -107,29 +107,28 @@ void callback(char* topic, byte* payload, unsigned int length) {
   }
   Serial.print("Payload: ");
   Serial.println(message);
-  
+
   // Check which topic the message came from
   if (strcmp(topic, mqtt_topic_angle) == 0) {
     // Direct angle command - payload should be a number
     int angle = message.toInt();
     Serial.print("Parsed angle: ");
     Serial.println(angle);
-    
+
     if (angle >= minAngle && angle <= maxAngle) {
       handleAngleCommand(angle);
     } else {
       Serial.println("❌ Angle out of range (0-180)");
     }
-  }
-  else {
+  } else {
     // Main movement topic - parse JSON with all fields
-    DynamicJsonDocument doc(512);  // Increased buffer for all fields
+    DynamicJsonDocument doc(512); // Increased buffer for all fields
     DeserializationError error = deserializeJson(doc, message);
-    
+
     if (error) {
       Serial.print("❌ JSON parsing failed: ");
       Serial.println(error.c_str());
-      
+
       // Try to parse as simple angle if JSON fails
       int angle = message.toInt();
       if (angle >= minAngle && angle <= maxAngle) {
@@ -138,15 +137,15 @@ void callback(char* topic, byte* payload, unsigned int length) {
       }
       return;
     }
-    
+
     // Extract all fields from the message
-    const char* status = doc["status"] | "UNKNOWN";
+    const char *status = doc["status"] | "UNKNOWN";
     int angle = doc["angle"] | -1;
     float confidence = doc["confidence"] | 0.0;
     long timestamp = doc["timestamp"] | 0;
     int frame = doc["frame"] | 0;
-    const char* target = doc["target"] | "unknown";
-    
+    const char *target = doc["target"] | "unknown";
+
     // If angle is not in the message, map from status (fallback)
     if (angle == -1) {
       if (strcmp(status, "MOVE_LEFT") == 0) {
@@ -162,10 +161,10 @@ void callback(char* topic, byte* payload, unsigned int length) {
       }
       Serial.println("Using mapped angle from status (no angle field)");
     }
-    
+
     handleMovementMessage(status, angle, confidence, timestamp, frame, target);
   }
-  
+
   Serial.println("===========================================");
 }
 
@@ -173,30 +172,31 @@ void reconnect() {
   // Loop until we're reconnected
   while (!client.connected()) {
     Serial.print("Attempting MQTT connection...");
-    
+
     // Create a unique client ID
     String clientId = "ESP8266Servo-";
     clientId += String(random(0xffff), HEX);
-    
+
     // Attempt to connect
     if (client.connect(clientId.c_str())) {
       Serial.println("connected");
-      
+
       // Subscribe to both topics
       if (client.subscribe(mqtt_topic_sub)) {
         Serial.print("✅ Subscribed to: ");
         Serial.println(mqtt_topic_sub);
       }
-      
+
       if (client.subscribe(mqtt_topic_angle)) {
         Serial.print("✅ Subscribed to: ");
         Serial.println(mqtt_topic_angle);
       }
-      
+
       // Publish online status
-      String onlineMsg = "Servo controller online - Following face with exact angles";
+      String onlineMsg =
+          "Servo controller online - Following face with exact angles";
       client.publish(mqtt_topic_pub, onlineMsg.c_str());
-      
+
     } else {
       Serial.print("failed, rc=");
       Serial.print(client.state());
@@ -208,12 +208,12 @@ void reconnect() {
 
 void setup() {
   Serial.begin(9600);
-  
+
   // Initialize servo
   myServo.attach(servoPin, 500, 2400);
   myServo.write(DEFAULT_ANGLE);
   currentAngle = DEFAULT_ANGLE;
-  
+
   Serial.println();
   Serial.println("===========================================");
   Serial.println("SERVO MQTT CONTROLLER - EXACT ANGLE MODE");
@@ -228,18 +228,18 @@ void setup() {
   Serial.println("  - Direct angles to 'servo/angle' topic");
   Serial.println("  - Legacy status-only messages (mapped 0/90/180)");
   Serial.println("===========================================");
-  
+
   // Setup WiFi
   setup_wifi();
 
   // Test servo movement
   moveServo(90, "Initialization");
-  
+
   // Setup MQTT
   client.setServer(mqtt_server, mqtt_port);
   client.setCallback(callback);
-  client.setBufferSize(1024);  // Increased buffer for larger messages
-  
+  client.setBufferSize(1024); // Increased buffer for larger messages
+
   delay(1000);
 }
 
@@ -248,13 +248,13 @@ void loop() {
     reconnect();
   }
   client.loop();
-  
+
   // Status update every 30 seconds
   unsigned long now = millis();
   if (now - lastMsgTime > 30000) {
     lastMsgTime = now;
-    
-    String statusMsg = "Current angle: " + String(currentAngle) + "° - Ready";
+
+    String statusMsg = "ANGLE:" + String(currentAngle);
     client.publish(mqtt_topic_pub, statusMsg.c_str());
     Serial.print("📊 Status: ");
     Serial.println(statusMsg);
