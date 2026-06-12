@@ -1,54 +1,51 @@
 # src/recognize.py
 """
 Multi-face recognition (CPU-friendly) using your now-stable pipeline:
-
 Haar (multi-face) -> FaceMesh 5pt (per-face ROI) -> align_face_5pt (112x112)
 -> ArcFace ONNX embedding -> cosine distance to DB -> label each face.
-
 Run:
 python -m src.recognize
-
 Keys:
 q : quit
 r : reload DB from disk (data/db/face_db.npz)
 +/- : adjust threshold (distance) live
 d : toggle debug overlay
-
 Notes:
-- We run FaceMesh on EACH Haar face ROI (not the full frame). This avoids the "FaceMesh points not consistent with Haar box" problem and enables multi-face.
+- We run FaceMesh on EACH Haar face ROI (not the full frame). This avoids the
+“FaceMesh points not consistent with Haar box” problem and enables multi-face.
 - DB is expected from enroll: data/db/face_db.npz (name -> embedding vector)
-- Distance definition: cosine distance = 1 - cosine similarity.
-Since embeddings are L2-normalized, cosine similarity = dot(a,b).
+- Distance definition: cosine_distance = 1 - cosine_similarity.
+Since embeddings are L2-normalized, cosine_similarity = dot(a,b).
 """
 
 from __future__ import annotations
-
 import time
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-
 import cv2
 import numpy as np
 import onnxruntime as ort
 
 try:
     import mediapipe as mp
-    from .mediapipe_compat import MediaPipeFaceMeshCompat
+    try:
+        from mediapipe import solutions as mp_solutions  # type: ignore[attr-defined]
+    except Exception:
+        import mediapipe.solutions as mp_solutions  # type: ignore[assignment]
+    if not hasattr(mp, "solutions"):
+        mp.solutions = mp_solutions  # type: ignore[assignment]
 except Exception as e:
     mp = None
-    MediaPipeFaceMeshCompat = None
-    MP_IMPORT_ERROR = e
+    _MP_IMPORT_ERROR = e
 
-# Reuse your known-good alignment method (you said alignment is OK now)
 from .haar_5pt import align_face_5pt
-from .face_detector import RobustFaceDetector, FaceDetectionResult
 
-# ----------------------------------
+
+# -------------------------
 # Data
-# ----------------------------------
-
-
+# -------------------------
 @dataclass
 class FaceDet:
     x1: int
@@ -56,7 +53,8 @@ class FaceDet:
     x2: int
     y2: int
     score: float
-    kps: np.ndarray  # (5,2) float32 in FULL-frame coords
+    kps: np.ndarray
+    # (5,2) float32 in FULL-frame coords
 
 
 @dataclass
@@ -67,11 +65,9 @@ class MatchResult:
     accepted: bool
 
 
-# ----------------------------------
+# -------------------------
 # Math helpers
-# ----------------------------------
-
-
+# -------------------------
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     a = a.reshape(-1).astype(np.float32)
     b = b.reshape(-1).astype(np.float32)
@@ -82,7 +78,7 @@ def cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
     return 1.0 - cosine_similarity(a, b)
 
 
-def clip_xyxy(
+def _clip_xyxy(
     x1: float, y1: float, x2: float, y2: float, W: int, H: int
 ) -> Tuple[int, int, int, int]:
     x1 = int(max(0, min(W - 1, round(x1))))
@@ -111,15 +107,30 @@ def _bbox_from_5pt(
     x_max = float(np.max(k[:, 0]))
     y_min = float(np.min(k[:, 1]))
     y_max = float(np.max(k[:, 1]))
-
     w = max(1.0, x_max - x_min)
     h = max(1.0, y_max - y_min)
-
     x1 = x_min - pad_x * w
     x2 = x_max + pad_x * w
     y1 = y_min - pad_y_top * h
     y2 = y_max + pad_y_bot * h
     return np.array([x1, y1, x2, y2], dtype=np.float32)
+
+
+def _approx_5pt_from_haar_box(x: int, y: int, w: int, h: int) -> np.ndarray:
+    x = float(x)
+    y = float(y)
+    w = float(w)
+    h = float(h)
+    return np.array(
+        [
+            [x + 0.32 * w, y + 0.40 * h],  # left eye
+            [x + 0.68 * w, y + 0.40 * h],  # right eye
+            [x + 0.50 * w, y + 0.58 * h],  # nose tip
+            [x + 0.38 * w, y + 0.74 * h],  # left mouth
+            [x + 0.62 * w, y + 0.74 * h],  # right mouth
+        ],
+        dtype=np.float32,
+    )
 
 
 def _kps_span_ok(kps: np.ndarray, min_eye_dist: float) -> bool:
@@ -138,13 +149,11 @@ def _kps_span_ok(kps: np.ndarray, min_eye_dist: float) -> bool:
     return True
 
 
-# ----------------------------------
+# -------------------------
 # DB helpers
-# ----------------------------------
-
-
+# -------------------------
 def load_db_npz(db_path: Path) -> Dict[str, np.ndarray]:
-    if not db_path.exists() or db_path.stat().st_size == 0:
+    if not db_path.exists():
         return {}
     data = np.load(str(db_path), allow_pickle=True)
     out: Dict[str, np.ndarray] = {}
@@ -153,11 +162,9 @@ def load_db_npz(db_path: Path) -> Dict[str, np.ndarray]:
     return out
 
 
-# ----------------------------------
+# -------------------------
 # Embedder (same as embed_new)
-# ----------------------------------
-
-
+# -------------------------
 class ArcFaceEmbedderONNX:
     """
     ArcFace-style ONNX embedder.
@@ -173,12 +180,10 @@ class ArcFaceEmbedderONNX:
     ):
         self.model_path = model_path
         self.in_w, self.in_h = int(input_size[0]), int(input_size[1])
-        self.debug = debug
-
+        self.debug = bool(debug)
         self.sess = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
         self.in_name = self.sess.get_inputs()[0].name
         self.out_name = self.sess.get_outputs()[0].name
-
         if self.debug:
             print("[embed] model:", model_path)
             print(
@@ -200,10 +205,10 @@ class ArcFaceEmbedderONNX:
             img = cv2.resize(
                 img, (self.in_w, self.in_h), interpolation=cv2.INTER_LINEAR
             )
-
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32)
         rgb = (rgb - 127.5) / 128.0
-        x = np.transpose(rgb, (2, 0, 1))[None, ...]
+        # Model expects NHWC: (1, H, W, 3)
+        x = np.transpose(rgb, (2, 0, 1))[None, ...]  # Correct - NCHW format
         return x.astype(np.float32)
 
     @staticmethod
@@ -219,11 +224,9 @@ class ArcFaceEmbedderONNX:
         return self._l2_normalize(emb)
 
 
-# ----------------------------------
+# -------------------------
 # Multi-face Haar + FaceMesh(ROI) 5pt
-# ----------------------------------
-
-
+# -------------------------
 class HaarFaceMesh5pt:
     def __init__(
         self,
@@ -233,29 +236,26 @@ class HaarFaceMesh5pt:
     ):
         self.debug = bool(debug)
         self.min_size = tuple(map(int, min_size))
-
         if haar_xml is None:
             haar_xml = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
         self.face_cascade = cv2.CascadeClassifier(haar_xml)
         if self.face_cascade.empty():
             raise RuntimeError(f"Failed to load Haar cascade: {haar_xml}")
-
-        if mp is None or MediaPipeFaceMeshCompat is None:
-            raise RuntimeError(
-                f"mediapipe import failed: {MP_IMPORT_ERROR}\n"
-                f"Install: pip install mediapipe"
+        self.mesh = None
+        if mp is not None and hasattr(mp, "solutions"):
+            self.mesh = mp.solutions.face_mesh.FaceMesh(
+                static_image_mode=False,
+                max_num_faces=1,
+                refine_landmarks=True,
+                min_detection_confidence=0.5,
+                min_tracking_confidence=0.5,
             )
-
-        # Initialize with compatibility layer
-        self.mesh = MediaPipeFaceMeshCompat(
-            static_image_mode=False,
-            max_num_faces=1,
-            refine_landmarks=True,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
-        )
-
-        # 5pt indices (same as your working file)
+        elif self.debug:
+            print(
+                "[recognize] MediaPipe FaceMesh unavailable; "
+                "falling back to Haar-only 5pt estimation."
+            )
+            print(f"[recognize] mediapipe import detail: {_MP_IMPORT_ERROR}")
         self.IDX_LEFT_EYE = 33
         self.IDX_RIGHT_EYE = 263
         self.IDX_NOSE_TIP = 1
@@ -272,75 +272,70 @@ class HaarFaceMesh5pt:
         )
         if faces is None or len(faces) == 0:
             return np.zeros((0, 4), dtype=np.int32)
-        return faces.astype(np.int32)  # (x, y, w, h)
+        return faces.astype(np.int32)
 
     def _roi_facemesh_5pt(self, roi_bgr: np.ndarray) -> Optional[np.ndarray]:
+        if self.mesh is None:
+            return None
         H, W = roi_bgr.shape[:2]
         if H < 20 or W < 20:
             return None
-
-        # Use compatibility layer
-        face_landmarks_list = self.mesh.process(roi_bgr)
-        if not face_landmarks_list:
+        rgb = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2RGB)
+        res = self.mesh.process(rgb)
+        if not res.multi_face_landmarks:
             return None
-
-        # Get first face landmarks
-        face_landmarks = face_landmarks_list[0]
-        landmarks = face_landmarks.landmarks
-
-        # Extract 5 key points using the compatibility layer
-        kps = self.mesh.extract_5_points(landmarks)
-
-        # Ensure left/right ordering for eyes & mouth
-        if kps[0, 0] > kps[1, 0]:  # left eye x > right eye x
+        lm = res.multi_face_landmarks[0].landmark
+        idxs = [
+            self.IDX_LEFT_EYE,
+            self.IDX_RIGHT_EYE,
+            self.IDX_NOSE_TIP,
+            self.IDX_MOUTH_LEFT,
+            self.IDX_MOUTH_RIGHT,
+        ]
+        pts = []
+        for i in idxs:
+            p = lm[i]
+            pts.append([p.x * W, p.y * H])
+        kps = np.array(pts, dtype=np.float32)
+        if kps[0, 0] > kps[1, 0]:
             kps[[0, 1]] = kps[[1, 0]]
-        if kps[3, 0] > kps[4, 0]:  # left mouth x > right mouth x
+        if kps[3, 0] > kps[4, 0]:
             kps[[3, 4]] = kps[[4, 3]]
-
         return kps
 
     def detect(self, frame_bgr: np.ndarray, max_faces: int = 5) -> List[FaceDet]:
         H, W = frame_bgr.shape[:2]
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-
         faces = self._haar_faces(gray)
         if faces.shape[0] == 0:
             return []
-
-        # sort by area desc, keep top max faces
         areas = faces[:, 2] * faces[:, 3]
         order = np.argsort(areas)[::-1]
         faces = faces[order][:max_faces]
-
         out: List[FaceDet] = []
-
         for x, y, w, h in faces:
-            # expand ROI a bit for FaceMesh stability
             mx, my = 0.25 * w, 0.35 * h
-            rx1, ry1, rx2, ry2 = clip_xyxy(x - mx, y - my, x + w + mx, y + h + my, W, H)
-            roi = frame_bgr[ry1:ry2, rx1:rx2]
-
-            kps_roi = self._roi_facemesh_5pt(roi)
-            if kps_roi is None:
-                if self.debug:
-                    print("[recognize] FaceMesh none for ROI -> skip")
-                continue
-
-            # map ROI kps back to full-frame coords
-            kps = kps_roi.copy()
-            kps[:, 0] += float(rx1)
-            kps[:, 1] += float(ry1)
-
-            # sanity: eye distance relative to Haar width
+            rx1, ry1, rx2, ry2 = _clip_xyxy(
+                x - mx, y - my, x + w + mx, y + h + my, W, H
+            )
+            if self.mesh is None:
+                kps = _approx_5pt_from_haar_box(int(x), int(y), int(w), int(h))
+            else:
+                roi = frame_bgr[ry1:ry2, rx1:rx2]
+                kps_roi = self._roi_facemesh_5pt(roi)
+                if kps_roi is None:
+                    if self.debug:
+                        print("[recognize] FaceMesh none for ROI -> skip")
+                    continue
+                kps = kps_roi.copy()
+                kps[:, 0] += float(rx1)
+                kps[:, 1] += float(ry1)
             if not _kps_span_ok(kps, min_eye_dist=max(10.0, 0.18 * float(w))):
                 if self.debug:
                     print("[recognize] 5pt geometry failed -> skip")
                 continue
-
-            # build bbox from kps (centered)
             bb = _bbox_from_5pt(kps, pad_x=0.55, pad_y_top=0.85, pad_y_bot=1.15)
-            x1, y1, x2, y2 = clip_xyxy(bb[0], bb[1], bb[2], bb[3], W, H)
-
+            x1, y1, x2, y2 = _clip_xyxy(bb[0], bb[1], bb[2], bb[3], W, H)
             out.append(
                 FaceDet(
                     x1=x1,
@@ -351,26 +346,21 @@ class HaarFaceMesh5pt:
                     kps=kps.astype(np.float32),
                 )
             )
-
         return out
 
 
-# ----------------------------------
+# -------------------------
 # Matcher
-# ----------------------------------
-
-
+# -------------------------
 class FaceDBMatcher:
     def __init__(self, db: Dict[str, np.ndarray], dist_thresh: float = 0.34):
         self.db = db
         self.dist_thresh = float(dist_thresh)
-
-        # pre-stack for speed
         self._names: List[str] = []
         self._mat: Optional[np.ndarray] = None
-        self.rebuild()
+        self._rebuild()
 
-    def rebuild(self):
+    def _rebuild(self):
         self._names = sorted(self.db.keys())
         if self._names:
             self._mat = np.stack(
@@ -381,20 +371,17 @@ class FaceDBMatcher:
 
     def reload_from(self, path: Path):
         self.db = load_db_npz(path)
-        self.rebuild()
+        self._rebuild()
 
     def match(self, emb: np.ndarray) -> MatchResult:
         if self._mat is None or len(self._names) == 0:
             return MatchResult(name=None, distance=1.0, similarity=0.0, accepted=False)
-
-        e = emb.reshape(1, -1).astype(np.float32)  # (1,D)
-        # cosine similarity since both sides are normalized: sim = dot
-        sims = (self._mat @ e.T).reshape(-1)  # (K,)
+        e = emb.reshape(1, -1).astype(np.float32)
+        sims = (self._mat @ e.T).reshape(-1)
         best_i = int(np.argmax(sims))
         best_sim = float(sims[best_i])
         best_dist = 1.0 - best_sim
         ok = best_dist <= self.dist_thresh
-
         return MatchResult(
             name=self._names[best_i] if ok else None,
             distance=float(best_dist),
@@ -403,59 +390,37 @@ class FaceDBMatcher:
         )
 
 
-# ----------------------------------
+# -------------------------
 # Demo
-# ----------------------------------
-
-
+# -------------------------
 def main():
     db_path = Path("data/db/face_db.npz")
-
-    det = RobustFaceDetector(
-        min_size=(100, 100),  # Increased min_size to reduce noise
-        confidence_threshold=0.7,
-        quality_threshold=0.3,
-        enable_mediapipe=True,
+    det = HaarFaceMesh5pt(
+        min_size=(70, 70),
         debug=False,
     )
-
     embedder = ArcFaceEmbedderONNX(
         model_path="models/embedder_arcface.onnx",
         input_size=(112, 112),
         debug=False,
     )
-
     db = load_db_npz(db_path)
-    matcher = FaceDBMatcher(db=db, dist_thresh=0.34)  # from your evaluate_new_output
-
+    matcher = FaceDBMatcher(db=db, dist_thresh=0.62)
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         raise RuntimeError("Camera not available")
-
     print("Recognize (multi-face). q=quit, r=reload DB, +/- threshold, d=debug overlay")
-
     t0 = time.time()
     frames = 0
     fps: Optional[float] = None
     show_debug = False
 
-    # Recognition optimization
-    # Format: {(center_x, center_y): (MatchResult, frame_count)}
-    identity_cache = {}
-    recognition_interval = 10  # frames between heavy AI re-checks
-    frame_idx = 0
-    cache_dist_thresh = 80  # pixels
-
     while True:
         ok, frame = cap.read()
         if not ok:
             break
-        frame_idx += 1
-
-        faces = det.detect_faces(frame, max_faces=10)  # Increased to handle more faces
+        faces = det.detect(frame, max_faces=5)
         vis = frame.copy()
-
-        # compute fps
         frames += 1
         dt = time.time() - t0
         if dt >= 1.0:
@@ -463,89 +428,47 @@ def main():
             frames = 0
             t0 = time.time()
 
-        # draw + recognize each face
-        # show aligned thumbnails stacked on the RIGHT, but lower to avoid overlay with green text
         h, w = vis.shape[:2]
         thumb = 112
         pad = 8
         x0 = w - thumb - pad
-        y0 = 80  # moved down to avoid your text overlay area
+        y0 = 80
         shown = 0
 
         for i, f in enumerate(faces):
-            center = ((f.x1 + f.x2) // 2, (f.y1 + f.y2) // 2)
-
-            # 1. Try to find identity in cache
-            mr = None
-            needs_recognition = frame_idx % recognition_interval == 0
-
-            # Clean up old cache entries
-            identity_cache = {
-                pos: val
-                for pos, val in identity_cache.items()
-                if frame_idx - val[1] < 5
-            }
-
-            if not needs_recognition:
-                # Spatial proximity check
-                for pos, (cached_mr, last_fidx) in identity_cache.items():
-                    dist = np.sqrt(
-                        (center[0] - pos[0]) ** 2 + (center[1] - pos[1]) ** 2
-                    )
-                    if dist < cache_dist_thresh:
-                        mr = cached_mr
-                        break
-
-            # 2. If not found or interval hit, do heavy recognition
-            if mr is None:
-                # align -> embed -> match using face detector's alignment
-                try:
-                    aligned, _ = det.align_face(frame, f, out_size=(112, 112))
-                    emb = embedder.embed(aligned)
-                    mr = matcher.match(emb)
-
-                    # Update cache
-                    identity_cache[center] = (mr, frame_idx)
-                except Exception as e:
-                    print(f"Recognition failed: {e}")
-                    continue
-            else:
-                # Still need 'aligned' for preview thumbnails if it's new
-                # but we can reuse the cached mr.
-                # Only align if we actually need the thumbnail
-                try:
-                    aligned, _ = det.align_face(frame, f, out_size=(112, 112))
-                except Exception:
-                    continue
-
-            # label
+            cv2.rectangle(vis, (f.x1, f.y1), (f.x2, f.y2), (0, 255, 0), 2)
+            for x, y in f.kps.astype(int):
+                cv2.circle(vis, (int(x), int(y)), 2, (0, 255, 0), -1)
+            aligned, _ = align_face_5pt(frame, f.kps, out_size=(112, 112))
+            emb = embedder.embed(aligned)
+            mr = matcher.match(emb)
             label = mr.name if mr.name is not None else "Unknown"
             line1 = f"{label}"
             line2 = f"dist={mr.distance:.3f} sim={mr.similarity:.3f}"
-
-            # color: known green, unknown red
             color = (0, 255, 0) if mr.accepted else (0, 0, 255)
-
-            # draw bbox + kps
-            cv2.rectangle(vis, (f.x1, f.y1), (f.x2, f.y2), color, 2)
-            for (x, y) in f.kps.astype(int):
-                cv2.circle(vis, (int(x), int(y)), 2, (255, 255, 255), -1)
-
-            # draw text
-            cv2.putText(vis, line1, (f.x1, max(0, f.y1 - 25)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-            cv2.putText(vis, line2, (f.x1, max(0, f.y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-
-            # show quality score if available
-            if hasattr(f, 'quality_score'):
-                quality_text = f"Q={f.quality_score:.2f}"
-                cv2.putText(vis, quality_text, (f.x1, f.y2 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-
-            # aligned preview thumbnails (stack)
+            cv2.putText(
+                vis,
+                line1,
+                (f.x1, max(0, f.y1 - 28)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                color,
+                2,
+            )
+            cv2.putText(
+                vis,
+                line2,
+                (f.x1, max(0, f.y1 - 6)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                color,
+                2,
+            )
             if y0 + thumb <= h and shown < 4:
                 vis[y0 : y0 + thumb, x0 : x0 + thumb] = aligned
                 cv2.putText(
                     vis,
-                    f"{i + 1}: {label}",
+                    f"{i+1}:{label}",
                     (x0, y0 - 6),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.55,
@@ -556,8 +479,7 @@ def main():
                 shown += 1
 
         if show_debug:
-            # show kps coords quickly
-            dbg = f"kpsLeye={f.kps[0, 0]:.0f},{f.kps[0, 1]:.0f}"
+            dbg = f"kpsLeye=({f.kps[0,0]:.0f},{f.kps[0,1]:.0f})"
             cv2.putText(
                 vis,
                 dbg,
@@ -568,7 +490,6 @@ def main():
                 2,
             )
 
-        # overlay header
         header = f"IDs={len(matcher._names)} thr(dist)={matcher.dist_thresh:.2f}"
         if fps is not None:
             header += f" fps={fps:.1f}"
@@ -578,22 +499,20 @@ def main():
 
         cv2.imshow("recognize_new", vis)
         key = cv2.waitKey(1) & 0xFF
-
         if key == ord("q"):
             break
         elif key == ord("r"):
             matcher.reload_from(db_path)
-            identity_cache = {}  # Clear cache on reload
             print(f"[recognize] reloaded DB: {len(matcher._names)} identities")
         elif key in (ord("+"), ord("=")):
             matcher.dist_thresh = float(min(1.20, matcher.dist_thresh + 0.01))
             print(
-                f"[recognize] thr(dist)={matcher.dist_thresh:.2f} (sim={1.0 - matcher.dist_thresh:.2f})"
+                f"[recognize] thr(dist)={matcher.dist_thresh:.2f} (sim~{1.0-matcher.dist_thresh:.2f})"
             )
         elif key == ord("-"):
             matcher.dist_thresh = float(max(0.05, matcher.dist_thresh - 0.01))
             print(
-                f"[recognize] thr(dist)={matcher.dist_thresh:.2f} (sim={1.0 - matcher.dist_thresh:.2f})"
+                f"[recognize] thr(dist)={matcher.dist_thresh:.2f} (sim~{1.0-matcher.dist_thresh:.2f})"
             )
         elif key == ord("d"):
             show_debug = not show_debug

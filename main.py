@@ -68,7 +68,7 @@ from src.recognize import HaarFaceMesh5pt as WorkingFaceDetector
 class ServoConfig:
     """Configuration for servo control system"""
 
-    broker: str = "10.42.0.1"
+    broker: str = "192.168.8.101"
     port: int = 1883
     topic_movement: str = "vision/team351/movement"
     topic_status: str = "robot/status"
@@ -1377,7 +1377,7 @@ def main():
     )
 
     # Initialize camera
-    cap = cv2.VideoCapture(1)
+    cap = cv2.VideoCapture(2)
     if not cap.isOpened():
         print("Error: Could not open camera")
         return
