@@ -301,7 +301,7 @@ void loop() {
   if (now - lastMsgTime > 30000) {
     lastMsgTime = now;
     
-    String statusMsg = String((int)currentAngle);
+    String statusMsg = String((int)currentAngle); 
     client.publish(mqtt_topic_pub, statusMsg.c_str());
     
     Serial.print("💓 Heartbeat - Angle: ");
